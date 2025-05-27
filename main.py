@@ -72,7 +72,7 @@ class Config:
     
     # External APIs
     MIRO_BASE_URL = "https://api.miro.com/v2"
-    DEFAULT_MODEL = "gpt-4"
+    DEFAULT_MODEL = "gpt-4o-mini"
     MAX_RETRIES = 3
     TIMEOUT = 30
     
@@ -467,6 +467,78 @@ class ReconciliationEngine(dspy.Module):
         return max(0.0, min(1.0, 1.0 - (changes_needed / total_items)))
 
 # ==============================================================================
+# Reconciliation Service
+# ==============================================================================
+
+class ReconciliationService:
+    """Service class that handles the main reconciliation logic"""
+    
+    def __init__(self):
+        # Initialize DSPy
+        dspy.settings.configure(
+            lm=dspy.LM(Config.DEFAULT_MODEL, api_key=Config.OPENAI_API_KEY)
+        )
+        
+        # Initialize all processors
+        self.spreadsheet_processor = SpreadsheetProcessor()
+        self.board_processor = MiroBoardProcessor()
+        self.reconciliation_engine = ReconciliationEngine()
+        self.sheets_client = GoogleSheetsClient()
+        self.miro_client = AsyncMiroClient(Config.MIRO_API_TOKEN)
+        
+    
+    async def reconcile(self, request: ReconciliationRequest) -> ReconciliationResult:
+        """Perform the reconciliation"""
+        
+        # Initialize clients
+        # Fetch data
+        df = await self.sheets_client.get_sheet_data(
+            request.user_token,
+            request.google_sheets.spreadsheet_id,
+            request.google_sheets.sheet_name,
+            request.google_sheets.range
+        )
+        
+        miro_items = await self.miro_client.get_board_items(request.miro_board_id)
+        
+        # Process data
+        features = self.spreadsheet_processor(df)
+        relevant_items = self.board_processor(miro_items)
+        result = self.reconciliation_engine(features, relevant_items)
+        
+        # Apply changes if needed
+        if not request.dry_run:
+            applied_count = await self._apply_changes(self.miro_client, request.miro_board_id, result.actions)
+            result.summary += f" | Added {applied_count} notes to board"
+        
+        return result
+    
+    async def _apply_changes(self, miro_client: AsyncMiroClient, board_id: str, actions: List[UpdateAction]) -> int:
+        """Apply the recommended changes"""
+        applied_count = 0
+        
+        for i, action in enumerate(actions):
+            try:
+                if action.action_type == 'add' and action.feature:
+                    content = f"ADD: {action.feature.name}\nStatus: {action.feature.status}\nOwner: {action.feature.owner}"
+                elif action.action_type == 'update' and action.miro_item:
+                    item_name = action.miro_item.content[:30] if action.miro_item.content else "Unknown item"
+                    content = f"UPDATE: {item_name}\n{action.reason}"
+                else:
+                    content = f"{action.action_type.upper()}: {action.reason}"
+                
+                position = {'x': -300, 'y': 100 + (i * 120)}
+                
+                success = await miro_client.create_sticky_note(board_id, content, position)
+                if success:
+                    applied_count += 1
+                    
+            except Exception as e:
+                logger.error(f"Failed to create note: {e}")
+        
+        return applied_count
+
+# ==============================================================================
 # Background Tasks with Celery
 # ==============================================================================
 
@@ -483,115 +555,29 @@ redis_client = redis.from_url(Config.REDIS_URL)
 @celery_app.task(bind=True)
 def perform_reconciliation_task(self, request_data: dict):
     """Background task to perform reconciliation"""
-    try:
-        # Initialize DSPy
-        dspy.settings.configure(
-            lm=dspy.LM(Config.DEFAULT_MODEL, api_key=Config.OPENAI_API_KEY)
-        )
-        
-        # Parse request
-        req = ReconciliationRequest(**request_data)
-        
-        # Update progress
-        self.update_state(state='PROGRESS', meta={'current': 10, 'total': 100})
-        
-        # Initialize clients
-        sheets_client = GoogleSheetsClient()
-        miro_client = AsyncMiroClient(Config.MIRO_API_TOKEN)
-        
-        # Initialize processors
-        spreadsheet_processor = SpreadsheetProcessor()
-        board_processor = MiroBoardProcessor()
-        reconciliation_engine = ReconciliationEngine()
-        
-        # Fetch Google Sheets data
-        self.update_state(state='PROGRESS', meta={'current': 30, 'total': 100})
-        
-        # Note: In real Celery task, you'd need to handle async properly
-        # For this example, we'll simulate the process
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        df = loop.run_until_complete(
-            sheets_client.get_sheet_data(
-                req.user_token,
-                req.google_sheets.spreadsheet_id,
-                req.google_sheets.sheet_name,
-                req.google_sheets.range
-            )
-        )
-        
-        # Process spreadsheet
-        self.update_state(state='PROGRESS', meta={'current': 50, 'total': 100})
-        features = spreadsheet_processor(df)
-        
-        # Fetch Miro data
-        self.update_state(state='PROGRESS', meta={'current': 70, 'total': 100})
-        miro_items = loop.run_until_complete(
-            miro_client.get_board_items(req.miro_board_id)
-        )
-        
-        # Filter relevant items
-        relevant_items = board_processor(miro_items)
-        
-        # Perform reconciliation
-        self.update_state(state='PROGRESS', meta={'current': 90, 'total': 100})
-        print(features, relevant_items)
-        result = reconciliation_engine(features, relevant_items)
-        result.job_id = self.request.id
-        
-        # Apply changes if not dry run
-        if not req.dry_run:
-            self.update_state(state='PROGRESS', meta={'current': 95, 'total': 100})
+    
+    async def main():
+        try:
+            req = ReconciliationRequest(**request_data)
             
-            async def apply_changes():
-                applied_count = 0
-                
-                for i, action in enumerate(result.actions):
-                    try:
-                        # Create specific content with actual names
-                        if action.action_type == 'add' and action.feature:
-                            content = f"ADD: {action.feature.name}\nStatus: {action.feature.status}\nOwner: {action.feature.owner}"
-                        elif action.action_type == 'update' and action.miro_item:
-                            item_name = action.miro_item.content[:30] if action.miro_item.content else "Unknown item"
-                            content = f"UPDATE: {item_name}\n{action.reason}"
-                        elif action.action_type == 'remove' and action.miro_item:
-                            item_name = action.miro_item.content[:30] if action.miro_item.content else "Unknown item" 
-                            content = f"REMOVE: {item_name}\n{action.reason}"
-                        else:
-                            content = f"{action.action_type.upper()}: {action.reason}"
-                        
-                        position = {'x': -300, 'y': 100 + (i * 120)}
-                        
-                        success = await miro_client.create_sticky_note(
-                            req.miro_board_id,
-                            content,
-                            position
-                        )
-                        
-                        if success:
-                            applied_count += 1
-                            
-                    except Exception as e:
-                        logger.error(f"Failed to create note: {e}")
-                
-                return applied_count
+            self.update_state(state='PROGRESS', meta={'current': 20, 'total': 100})
             
-            applied_count = loop.run_until_complete(apply_changes())
-            result.summary += f" | Added {applied_count} notes to board"
-        
-        self.update_state(state='PROGRESS', meta={'current': 100, 'total': 100})
-        
-        return result.dict()
-        
-    except Exception as e:
-        logger.error(f"Task failed: {e}")
-        self.update_state(
-            state='FAILURE',
-            meta={'error': str(e)}
-        )
-        raise
-
+            service = ReconciliationService()
+            
+            self.update_state(state='PROGRESS', meta={'current': 50, 'total': 100})
+            
+            result = await service.reconcile(req)
+            result.job_id = self.request.id
+            
+            self.update_state(state='PROGRESS', meta={'current': 100, 'total': 100})
+            return result.dict()
+            
+        except Exception as e:
+            logger.error(f"Task failed: {e}")
+            self.update_state(state='FAILURE', meta={'error': str(e)})
+            raise
+    
+    return asyncio.run(main())
 # ==============================================================================
 # FastAPI Application
 # ==============================================================================
