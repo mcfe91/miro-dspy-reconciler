@@ -1,7 +1,8 @@
 # Miro Board Reconciler
 
 Syncs Google Sheets with Miro boards using AI to intelligently match features and add sync status notes.
-<img width="256" alt="image" src="https://github.com/user-attachments/assets/a43522a8-13ef-403e-9a08-a920789acdd7" />
+
+![image](https://github.com/user-attachments/assets/b719310c-6bcc-43d5-a3bb-d66142f24102)
 <img width="633" alt="image" src="https://github.com/user-attachments/assets/29845d9c-c257-45f1-8890-51033aa0c693" />
 
 
