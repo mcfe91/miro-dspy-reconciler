@@ -5,7 +5,6 @@
 
 import dspy
 import pandas as pd
-import json
 import logging
 from typing import List, Dict, Any, Optional
 import asyncio
@@ -45,33 +44,35 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ==============================================================================
 
-#  TODO: throw if missing
+def get_required_env(key: str) -> str:
+    """Get required environment variable or raise error"""
+    value = os.getenv(key)
+    if not value:
+        raise ValueError(f"Missing required environment variable: {key}")
+    return value
+
 class Config:
     """Application configuration"""
-    # API Keys
-    MIRO_API_TOKEN = os.getenv("MIRO_API_TOKEN")
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    # Required API Keys
+    MIRO_API_TOKEN = get_required_env("MIRO_API_TOKEN")
+    OPENAI_API_KEY = get_required_env("OPENAI_API_KEY")
+    GOOGLE_CLIENT_ID = get_required_env("GOOGLE_CLIENT_ID")
+    GOOGLE_CLIENT_SECRET = get_required_env("GOOGLE_CLIENT_SECRET")
     
-    # Google Sheets
-    GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
-    GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+    # Optional with defaults
     GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/google/callback")
-    
-    # Redis for caching and background tasks
     REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-    
-    # API Configuration
     API_HOST = os.getenv("API_HOST", "0.0.0.0")
     API_PORT = int(os.getenv("API_PORT", "8000"))
     SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
     
-    # External APIs
+    # Constants
     MIRO_BASE_URL = "https://api.miro.com/v2"
     DEFAULT_MODEL = "gpt-4o-mini"
     MAX_RETRIES = 3
     TIMEOUT = 30
     
-    # Background processing
+    # Derived values
     CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", REDIS_URL)
     CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", REDIS_URL)
 
@@ -155,8 +156,8 @@ class UserInfo(BaseModel):
     """User information for authentication"""
     user_id: str
     email: str
-    google_token: Optional[str] = None
-    miro_token: Optional[str] = None
+    google_token: str
+    miro_token: str
 
 # ==============================================================================
 # DSPy Signatures (same as before)
@@ -516,7 +517,7 @@ class ReconciliationService:
                 else:
                     content = f"{action.action_type.upper()}: {action.reason}"
                 
-                position = {'x': -300, 'y': 100 + (i * 120)}
+                position = {'x': -300.0, 'y': 100.0 + (i * 120.0)}
                 
                 success = await miro_client.create_sticky_note(board_id, content, position)
                 if success:
@@ -602,7 +603,8 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     return UserInfo(
         user_id="user123",
         email="user@example.com",
-        google_token=token  # In reality, this would be stored securely
+        google_token=token,
+        miro_token=token,
     )
 
 # ==============================================================================
@@ -623,7 +625,7 @@ async def start_reconciliation(
     """Start a reconciliation job"""
     try:
         # Start background task
-        task = perform_reconciliation_task.delay(request.dict())
+        task = perform_reconciliation_task.delay(request.model_dump())
         
         # Store job info in Redis
         job_info = JobStatus(
