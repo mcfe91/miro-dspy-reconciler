@@ -101,6 +101,13 @@ class MiroItem(BaseModel):
     color: Optional[str] = Field(default=None, description="Item color")
     parent_id: Optional[str] = Field(default=None, description="Parent frame/group ID")
 
+class FeatureMatch(BaseModel):
+    """Represents a match between a spreadsheet feature and Miro item."""
+    feature: ProductFeature
+    miro_item: MiroItem
+    confidence_score: float
+    similarity_reasons: List[str]
+
 class UpdateAction(BaseModel):
     """Represents an action to take on the Miro board"""
     action_type: str = Field(description="Type: 'add', 'update', 'remove'")
@@ -182,13 +189,6 @@ class MiroBoardAnalyzer(dspy.Signature):
     relevant_items: List[MiroItem] = dspy.OutputField(
         desc="Filtered Miro items that are relevant to product development"
     )
-
-class FeatureMatch(BaseModel):
-    """Represents a match between a spreadsheet feature and Miro item."""
-    feature: ProductFeature
-    miro_item: MiroItem
-    confidence_score: float
-    similarity_reasons: List[str]
 
 class FeatureMatcher(dspy.Signature):
     """Match spreadsheet features with Miro board items using intelligent semantic matching.
