@@ -7,27 +7,21 @@ import dspy
 import pandas as pd
 import json
 import logging
-from typing import List, Dict, Any, Optional, Tuple, Set
-from dataclasses import dataclass, asdict
-from pathlib import Path
+from typing import List, Dict, Any, Optional
 import asyncio
 from datetime import datetime, timedelta
-import requests
 import os
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, HttpUrl
-import re
+from pydantic import BaseModel, Field
 
 # FastAPI imports
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Query, Path as PathParam
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import JSONResponse
 import uvicorn
 
 # Google Sheets imports
 from googleapiclient.discovery import build
-from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from google.auth.exceptions import RefreshError
@@ -51,6 +45,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ==============================================================================
 
+#  TODO: throw if missing
 class Config:
     """Application configuration"""
     # API Keys
@@ -168,37 +163,53 @@ class UserInfo(BaseModel):
 # ==============================================================================
 
 class SpreadsheetParser(dspy.Signature):
-    """Parse spreadsheet content and extract structured product features.
-    Return JSON array with exact field names: name, status, priority, description, owner"""
-    spreadsheet_content: str = dspy.InputField(desc="Raw spreadsheet content with headers and data rows")
-    features: str = dspy.OutputField(desc='JSON array like: [{"name": "Feature", "status": "Done", "priority": "High", "description": "Text", "owner": "Person"}]')
+    """Parse spreadsheet content into structured product features with names, descriptions, and priorities."""
+    
+    spreadsheet_content: str = dspy.InputField(
+        desc="Raw text content from Google Sheets containing product features"
+    )
+    features: List[ProductFeature] = dspy.OutputField(
+        desc="Extracted and structured product features from the spreadsheet"
+    )
 
 class MiroBoardAnalyzer(dspy.Signature):
-    """Analyze Miro board content and identify product-related items"""
-    miro_items_json: str = dspy.InputField(desc="JSON representation of all items on the Miro board")
-    relevant_items: str = dspy.OutputField(desc="JSON list of MiroItem objects that appear to be product features")
+    """Analyze Miro board items to identify content relevant to product features."""
+    
+    miro_items_json: str = dspy.InputField(
+        desc="JSON string representation of all Miro board items"
+    )
+    relevant_items: List[MiroItem] = dspy.OutputField(
+        desc="Filtered Miro items that are relevant to product development"
+    )
+
+class FeatureMatch(BaseModel):
+    """Represents a match between a spreadsheet feature and Miro item."""
+    feature: ProductFeature
+    miro_item: MiroItem
+    confidence_score: float
+    similarity_reasons: List[str]
 
 class FeatureMatcher(dspy.Signature):
     """Match spreadsheet features with Miro board items using intelligent semantic matching.
     
     Be smart about matching similar items:
-    - "Google Login" should match "Google Auth" or "Google Authentication"  
-    - "Dark Mode" should match "Dark theme" or "Dark mode toggle"
+    - "Gmail" should match "Google email"  
     - "User Profile" should match "User settings" or "Profile page"
     
     If items are 70%+ similar in meaning, consider them matched even if wording differs.
-    Only mark items as unmatched if they are truly different features.
+    Only mark items as unmatched if they are truly different features. Be generous with matching - 
+    err on the side of matching similar items rather than creating duplicates
     """
-    spreadsheet_features: str = dspy.InputField(desc="JSON list of ProductFeature objects from spreadsheet")
-    miro_items: str = dspy.InputField(desc="JSON list of MiroItem objects from board")
-    matches: str = dspy.OutputField(desc='''JSON object with three arrays:
-    {
-      "matched_pairs": [[feature_object, miro_item_object], ...],  // Items that refer to same feature
-      "unmatched_features": [feature_object, ...],  // Features with no similar board items
-      "unmatched_items": [miro_item_object, ...]   // Board items with no similar features
-    }
-    
-    Be generous with matching - err on the side of matching similar items rather than creating duplicates.''')
+
+    spreadsheet_features: List[ProductFeature] = dspy.InputField(
+        desc="Product features extracted from spreadsheet"
+    )
+    miro_items: List[MiroItem] = dspy.InputField(
+        desc="Relevant Miro board items to match against"
+    )
+    matches: List[FeatureMatch] = dspy.OutputField(
+        desc="Paired matches between features and Miro items with confidence scores"
+    )
 
 class UpdateRecommender(dspy.Signature):
     """Generate specific update recommendations.
@@ -210,16 +221,10 @@ class UpdateRecommender(dspy.Signature):
     For truly unmatched items:
     - Clearly state what needs to be added or removed
     """
-    matched_pairs: str = dspy.InputField(desc="JSON list of matched pairs")
-    unmatched_features: str = dspy.InputField(desc="JSON list of unmatched features")
-    unmatched_items: str = dspy.InputField(desc="JSON list of unmatched items")
-    recommendations: str = dspy.OutputField(desc='''JSON array like:
-    [
-      {"action_type": "add", "feature": {...}, "miro_item": null, "reason": "Add new feature: FeatureName", "priority": 2},
-      {"action_type": "update", "feature": {...}, "miro_item": {...}, "reason": "Update 'Google Auth' to 'Google Login' and sync status", "priority": 1}
-    ]
-    
-    Make reasons specific with actual feature names.''')
+    matched_pairs: List[FeatureMatch] = dspy.InputField(desc="List of matched pairs between features and Miro items")
+    unmatched_features: List[ProductFeature] = dspy.InputField(desc="List of unmatched features from spreadsheet")
+    unmatched_items: List[MiroItem] = dspy.InputField(desc="List of unmatched items from Miro board")
+    recommendations: List[UpdateAction] = dspy.OutputField(desc="List of recommended actions to reconcile the differences")
 
 # ==============================================================================
 # Enhanced API Clients
@@ -338,54 +343,49 @@ class AsyncMiroClient:
 # ==============================================================================
 
 class SpreadsheetProcessor(dspy.Module):
-    """Processes spreadsheet data to extract product features"""
-    
     def __init__(self):
-        super().__init__()
         self.parser = dspy.ChainOfThought(SpreadsheetParser)
     
     def forward(self, spreadsheet_df: pd.DataFrame) -> List[ProductFeature]:
-        """Convert DataFrame to structured features"""
+        # Convert DataFrame to text representation
         content = self._df_to_text(spreadsheet_df)
+        
+        # Call DSPy with proper typing
         result = self.parser(spreadsheet_content=content)
         
-        try:
-            features_data = json.loads(result.features)
-            return [ProductFeature(**feature) for feature in features_data]
-        except (json.JSONDecodeError, ValueError) as e:
-            logger.error(f"Failed to parse features: {e}")
-            return []
+        # Result.features is now properly typed as List[ProductFeature]
+        return result.features
     
     def _df_to_text(self, df: pd.DataFrame) -> str:
-        """Convert DataFrame to text representation"""
-        lines = []
-        lines.append("Headers: " + " | ".join(df.columns))
-        lines.append("-" * 50)
+        """Convert DataFrame to text format for LLM processing."""
+        if df.empty:
+            return "No data available"
         
-        for idx, row in df.iterrows():
-            row_text = " | ".join(str(val) for val in row.values)
-            lines.append(f"Row {idx + 1}: {row_text}")
+        # Create structured text representation
+        text_parts = []
+        for _, row in df.iterrows():
+            row_text = " | ".join([f"{col}: {val}" for col, val in row.items() if pd.notna(val)])
+            text_parts.append(row_text)
         
-        return "\n".join(lines)
+        return "\n".join(text_parts)
 
 class MiroBoardProcessor(dspy.Module):
-    """Processes Miro board data to identify relevant items"""
-    
     def __init__(self):
-        super().__init__()
         self.analyzer = dspy.ChainOfThought(MiroBoardAnalyzer)
     
     def forward(self, miro_items: List[MiroItem]) -> List[MiroItem]:
-        """Filter and identify product-relevant items"""
-        items_json = json.dumps([item.dict() for item in miro_items], indent=2)
-        result = self.analyzer(miro_items_json=items_json)
+        if not miro_items:
+            return []
         
-        try:
-            relevant_data = json.loads(result.relevant_items)
-            return [MiroItem(**item) for item in relevant_data]
-        except (json.JSONDecodeError, ValueError) as e:
-            logger.error(f"Failed to parse relevant items: {e}")
-            return miro_items
+        # Convert to JSON string for LLM
+        import json
+        miro_json = json.dumps([item.dict() for item in miro_items], indent=2)
+        
+        # Call DSPy with proper typing
+        result = self.analyzer(miro_items_json=miro_json)
+        
+        # Result.relevant_items is now properly typed as List[MiroItem]
+        return result.relevant_items
 
 class ReconciliationEngine(dspy.Module):
     """Main engine that reconciles spreadsheet features with Miro board"""
@@ -398,51 +398,40 @@ class ReconciliationEngine(dspy.Module):
     def forward(self, features: List[ProductFeature], miro_items: List[MiroItem]) -> ReconciliationResult:
         """Perform reconciliation and generate recommendations"""
         
-        # Step 1: Match features
-        features_json = json.dumps([f.dict() for f in features], indent=2)
-        items_json = json.dumps([i.dict() for i in miro_items], indent=2)
-        
-        match_result = self.matcher(
-            spreadsheet_features=features_json,
-            miro_items=items_json
+        # Step 1: Match features with Miro items
+        matches = self.matcher(
+            spreadsheet_features=features,
+            miro_items=miro_items
         )
         
-        try:
-            matches = json.loads(match_result.matches)
-        except json.JSONDecodeError:
-            logger.error("Failed to parse matching results")
-            return ReconciliationResult(
-                actions=[],
-                summary="Failed to process matches",
-                confidence_score=0.0
-            )
+        # Extract matched and unmatched items from the matches result
+        matched_pairs = matches.matches
         
-        # Step 2: Generate recommendations
+        # Determine unmatched features and items
+        matched_feature_ids = {match.feature.name for match in matched_pairs}
+        matched_item_ids = {match.miro_item.id for match in matched_pairs}
+        
+        unmatched_features = [f for f in features if f.name not in matched_feature_ids]
+        unmatched_items = [i for i in miro_items if i.id not in matched_item_ids]
+        
+        # Step 2: Generate recommendations using the updated signature
         rec_result = self.recommender(
-            matched_pairs=json.dumps(matches.get('matched_pairs', []), indent=2),
-            unmatched_features=json.dumps(matches.get('unmatched_features', []), indent=2),
-            unmatched_items=json.dumps(matches.get('unmatched_items', []), indent=2)
+            matched_pairs=matched_pairs,
+            unmatched_features=unmatched_features,
+            unmatched_items=unmatched_items
         )
         
-        try:
-            actions_data = json.loads(rec_result.recommendations)
-            actions = [UpdateAction(**action) for action in actions_data]
-            
-            summary = self._generate_summary(actions)
-            confidence = self._calculate_confidence(actions, features, miro_items)
-            
-            return ReconciliationResult(
-                actions=actions,
-                summary=summary,
-                confidence_score=confidence
-            )
-        except (json.JSONDecodeError, ValueError) as e:
-            logger.error(f"Failed to parse recommendations: {e}")
-            return ReconciliationResult(
-                actions=[],
-                summary="Failed to generate recommendations",
-                confidence_score=0.0
-            )
+        # rec_result.recommendations is now List[UpdateAction]
+        actions = rec_result.recommendations
+        
+        summary = self._generate_summary(actions)
+        confidence = self._calculate_confidence(actions, features, miro_items)
+        
+        return ReconciliationResult(
+            actions=actions,
+            summary=summary,
+            confidence_score=confidence
+        )
     
     def _generate_summary(self, actions: List[UpdateAction]) -> str:
         """Generate summary"""
@@ -476,7 +465,7 @@ class ReconciliationService:
     def __init__(self):
         # Initialize DSPy
         dspy.settings.configure(
-            lm=dspy.LM(Config.DEFAULT_MODEL, api_key=Config.OPENAI_API_KEY)
+            lm=dspy.LM(Config.DEFAULT_MODEL, api_key=Config.OPENAI_API_KEY, cache=False)
         )
         
         # Initialize all processors
@@ -552,6 +541,8 @@ celery_app = Celery(
 # Initialize Redis for caching
 redis_client = redis.from_url(Config.REDIS_URL)
 
+service = ReconciliationService()
+
 @celery_app.task(bind=True)
 def perform_reconciliation_task(self, request_data: dict):
     """Background task to perform reconciliation"""
@@ -561,8 +552,6 @@ def perform_reconciliation_task(self, request_data: dict):
             req = ReconciliationRequest(**request_data)
             
             self.update_state(state='PROGRESS', meta={'current': 20, 'total': 100})
-            
-            service = ReconciliationService()
             
             self.update_state(state='PROGRESS', meta={'current': 50, 'total': 100})
             
@@ -600,11 +589,6 @@ app.add_middleware(
 # Security
 security = HTTPBearer()
 
-# Initialize DSPy
-dspy.settings.configure(
-    lm=dspy.LM(Config.DEFAULT_MODEL, api_key=Config.OPENAI_API_KEY)
-)
-
 # ==============================================================================
 # API Dependencies
 # ==============================================================================
@@ -639,7 +623,6 @@ async def start_reconciliation(
     """Start a reconciliation job"""
     try:
         # Start background task
-        print(request.dict())
         task = perform_reconciliation_task.delay(request.dict())
         
         # Store job info in Redis
@@ -714,7 +697,7 @@ async def get_job_status(
         )
         
     except Exception as e:
-        raise HTTPException(status_code=404, detail="Job not found")
+        raise HTTPException(status_code=404, detail=f"Job not found. error: {e}")
 
 @app.get("/sheets/{spreadsheet_id}/preview")
 async def preview_spreadsheet(
